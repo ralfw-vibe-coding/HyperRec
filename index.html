@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>hyperrec</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="custom-titlebar" data-tauri-drag-region>
+      <span class="drag-handle" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span>
+      </span>
+      <button id="close-button" class="close-button" type="button" aria-label="hyperrec beenden">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6 6 18" />
+          <path d="M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+    <main class="page">
+      <div id="recorder" class="recorder ready">
+        <div class="topbar-row">
+          <div class="primary-slot">
+            <button id="record-button" class="icon-button" type="button" aria-label="Aufnahme starten">
+              <span class="record-dot" aria-hidden="true"></span>
+            </button>
+            <button id="stop-button" class="icon-button hidden" type="button" aria-label="Aufnahme stoppen">
+              <span class="stop-square" aria-hidden="true"></span>
+            </button>
+          </div>
+
+          <div id="timer" class="timer" aria-live="polite">00:00:00</div>
+
+          <div class="actions">
+            <button id="pause-resume-button" class="icon-button hidden" type="button" aria-label="Pause">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="14" y="3" width="5" height="18" rx="1" />
+                <rect x="5" y="3" width="5" height="18" rx="1" />
+              </svg>
+            </button>
+            <button id="download-button" class="icon-button hidden" type="button" aria-label="Aufnahme herunterladen">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 15V3" />
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <path d="m7 10 5 5 5-5" />
+              </svg>
+            </button>
+            <button id="trash-button" class="icon-button hidden" type="button" aria-label="Aufnahme verwerfen">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M10 11v6" />
+                <path d="M14 11v6" />
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                <path d="M3 6h18" />
+                <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="device-selects" id="device-selects">
+          <label class="select-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 19v3" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <rect x="9" y="2" width="6" height="13" rx="3" />
+            </svg>
+            <select id="input-device-select" aria-label="Mikrofon auswählen"></select>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </label>
+
+          <label class="select-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path
+                d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"
+              />
+              <path d="M16 9a5 5 0 0 1 0 6" />
+              <path d="M19.364 18.364a9 9 0 0 0 0-12.728" />
+            </svg>
+            <select id="output-device-select" aria-label="Audioausgabe auswählen"></select>
+            <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </label>
+        </div>
+
+        <p id="status-message" class="status-message"></p>
+      </div>
+    </main>
+  </body>
+</html>
