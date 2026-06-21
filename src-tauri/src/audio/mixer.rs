@@ -491,6 +491,54 @@ fn write_mic_only(
     })
 }
 
+/// Encodes the final mono WAV (produced by `mix_down`) to an MP3 at a
+/// fixed 96kbps — small enough to matter for multi-hour meeting
+/// recordings, plenty for spoken voice. Runs only on "Download", so the
+/// lossless WAV stays the source of truth for repeated saves.
+pub fn encode_wav_to_mp3(wav_path: &Path, mp3_path: &Path) -> Result<()> {
+    use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, MonoPcm, Quality};
+
+    let mut reader =
+        hound::WavReader::open(wav_path).map_err(|e| AudioError::Backend(e.to_string()))?;
+    let sample_rate = reader.spec().sample_rate;
+    let samples: Vec<i16> = reader
+        .samples::<i16>()
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+    let builder = Builder::new()
+        .ok_or_else(|| AudioError::Backend("could not create LAME encoder".to_string()))?;
+    let builder = builder
+        .with_num_channels(1)
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let builder = builder
+        .with_sample_rate(sample_rate)
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let builder = builder
+        .with_brate(Bitrate::Kbps96)
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let builder = builder
+        .with_quality(Quality::Best)
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let mut encoder = builder
+        .build()
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+    let mut mp3_data = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(samples.len()));
+    let encoded = encoder
+        .encode(MonoPcm(&samples), mp3_data.spare_capacity_mut())
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    unsafe { mp3_data.set_len(mp3_data.len() + encoded) };
+
+    mp3_data.reserve(7200);
+    let flushed = encoder
+        .flush::<FlushNoGap>(mp3_data.spare_capacity_mut())
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+    unsafe { mp3_data.set_len(mp3_data.len() + flushed) };
+
+    std::fs::write(mp3_path, &mp3_data).map_err(AudioError::Io)
+}
+
 pub fn timestamped_path(dir: &Path, prefix: &str) -> PathBuf {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -608,6 +656,37 @@ mod tests {
         assert!(
             error_after < error_before * 0.1,
             "expected echo cancellation to reduce error by >90%, before={error_before}, after={error_after}"
+        );
+    }
+
+    #[test]
+    fn encode_wav_to_mp3_produces_a_valid_mp3_stream() {
+        let sample_rate = 48_000u32;
+        let len = sample_rate as usize / 2;
+        let samples = make_complex_tone(len, sample_rate, &[440.0, 880.0], 0.3);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("hyperrec_mp3_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let wav_path = temp_dir.join("in.wav");
+        let mp3_path = temp_dir.join("out.mp3");
+        write_mono_i16_wav(&wav_path, &samples, sample_rate).unwrap();
+
+        encode_wav_to_mp3(&wav_path, &mp3_path).unwrap();
+        let mp3_bytes = std::fs::read(&mp3_path).unwrap();
+        let wav_bytes = std::fs::metadata(&wav_path).unwrap().len();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        assert!(
+            mp3_bytes.starts_with(b"ID3")
+                || (mp3_bytes.len() > 1 && mp3_bytes[0] == 0xFF && (mp3_bytes[1] & 0xE0) == 0xE0),
+            "output does not start with an ID3 tag or MP3 frame sync"
+        );
+        assert!(
+            (mp3_bytes.len() as u64) < wav_bytes / 3,
+            "expected MP3 at 96kbps to be noticeably smaller than the 16-bit WAV, mp3={} wav={}",
+            mp3_bytes.len(),
+            wav_bytes
         );
     }
 

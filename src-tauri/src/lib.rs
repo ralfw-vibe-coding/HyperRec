@@ -18,24 +18,24 @@ struct AppState {
 
 fn default_file_name(started_at: Option<DateTime<Local>>) -> String {
     let when = started_at.unwrap_or_else(Local::now);
-    format!("{}.wav", when.format("%Y-%m-%d_%H-%M-%S"))
+    format!("{}.mp3", when.format("%Y-%m-%d_%H-%M-%S"))
 }
 
 /// Opens the native save dialog and, if the user picked a destination,
-/// copies (not moves) `source` there — the temp file must stay usable
-/// for repeated saving until the app actually quits.
+/// encodes the (lossless, temp) WAV `source` to MP3 there. The temp WAV
+/// itself is left untouched so the recording can still be saved again.
 async fn prompt_save_as(app: &tauri::AppHandle, source: &std::path::Path, default_name: &str) -> Option<String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
         .set_file_name(default_name)
-        .add_filter("WAV", &["wav"])
+        .add_filter("MP3", &["mp3"])
         .save_file(move |path| {
             let _ = tx.send(path);
         });
 
     let chosen_path = rx.await.ok().flatten()?.into_path().ok()?;
-    std::fs::copy(source, &chosen_path).ok()?;
+    audio::mixer::encode_wav_to_mp3(source, &chosen_path).ok()?;
     Some(chosen_path.display().to_string())
 }
 

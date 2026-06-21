@@ -1,0 +1,6 @@
+# Cargo's build dir must live outside the project because the project
+# path contains a space ("08 Vibe Coding") — the autotools/libtool
+# build script vendored by mp3lame-sys breaks on unquoted `cd` into a
+# space-containing path. Redirecting target-dir elsewhere avoids it.
+[build]
+target-dir = "/Users/ralfw/Library/Caches/hyperrec-cargo-target"

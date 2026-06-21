@@ -10,6 +10,6 @@ Nicht nur Speicherung anbieten, sondern auch übernahme des audio ins clipboard.
 
 # Funktionalität
 
-- Audio speichern als mp3 statt als WAV.
+- 
 
 

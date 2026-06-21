@@ -610,3 +610,11 @@ Nach Stop landet die App im Zustand `recorded`. Der Nutzer entscheidet explizit:
 ### Optik
 
 Schlicht, Schwarz auf Weiß, 2px-Linien, keine Schatten/Farben, kompaktes Fenster (kein 800×600-Vollfenster mehr).
+
+---
+
+## Export als MP3 (Revision, 2026-06-21)
+
+Abweichend von "Keine MP3-Unterstützung" (siehe Einschränkungen Version 1): Der Download-Schritt exportiert jetzt als MP3 mit fester Bitrate 96 kbps statt als WAV. Grund: bei mehrstündigen Meeting-Mitschnitten ist die Dateigröße relevant (WAV ≈ 660 MB für 2h Mono/48kHz, MP3 @ 96kbps ≈ 85 MB), verlustbehaftete Kompression ist für reine Sprachaufnahmen unkritisch.
+
+Intern bleibt alles unverändert: Aufnahme und Mixdown erzeugen weiterhin eine verlustfreie 16-Bit-WAV-Temp-Datei (Single Source of Truth, mehrfach speicherbar). Erst beim Klick auf Download wird diese WAV einmalig nach MP3 enkodiert (LAME via `mp3lame-encoder`-Crate) und an den gewählten Speicherort geschrieben.
