@@ -112,6 +112,90 @@ fn cancel_acoustic_echo(mic: &mut [f32], system: &[f32], sample_rate: u32) {
     }
 }
 
+fn align_system_bleed_to_mic(system: Vec<f32>, mic: &[f32], sample_rate: u32) -> Vec<f32> {
+    const MAX_START_OFFSET_SECONDS: f64 = 3.0;
+    const ANALYSIS_SECONDS: f64 = 12.0;
+    const DECIMATION: usize = 64;
+    const MIN_ALIGNMENT_CORRELATION: f64 = 0.05;
+
+    let max_lag = ((sample_rate as f64 * MAX_START_OFFSET_SECONDS) as usize).min(system.len());
+    let analysis_len = ((sample_rate as f64 * ANALYSIS_SECONDS) as usize)
+        .min(mic.len())
+        .min(system.len());
+    if analysis_len < sample_rate as usize || max_lag == 0 {
+        return system;
+    }
+
+    let (lag, corr) = estimate_start_delay(
+        &mic[..analysis_len],
+        &system[..analysis_len],
+        max_lag,
+        DECIMATION,
+    );
+    if corr.abs() < MIN_ALIGNMENT_CORRELATION {
+        return system;
+    }
+
+    if lag > 0 {
+        eprintln!(
+            "HyperRec: aligning system audio later by {:.0}ms for acoustic echo cancellation",
+            lag as f64 * 1000.0 / sample_rate as f64
+        );
+        let mut aligned = vec![0.0; lag as usize];
+        aligned.extend(system);
+        aligned
+    } else {
+        system
+    }
+}
+
+fn estimate_start_delay(
+    mic: &[f32],
+    system: &[f32],
+    max_lag: usize,
+    decimation: usize,
+) -> (usize, f64) {
+    let decimation = decimation.max(1);
+    let mic_len = mic.len() / decimation;
+    let system_len = system.len() / decimation;
+    let max_lag = max_lag / decimation;
+    if mic_len == 0 || system_len == 0 {
+        return (0, 0.0);
+    }
+    let window = mic_len.min(system_len).saturating_sub(max_lag);
+    if window < 1024 {
+        return (0, 0.0);
+    }
+
+    let mut best_lag = 0usize;
+    let mut best_norm_corr = 0.0f64;
+
+    for lag in 0..=max_lag {
+        let mic_start = lag;
+        let system_start = 0usize;
+        let mut corr = 0.0f64;
+        let mut energy_mic = 0.0f64;
+        let mut energy_sys = 0.0f64;
+        for n in 0..window {
+            let m = mic[(mic_start + n) * decimation] as f64;
+            let s = system[(system_start + n) * decimation] as f64;
+            corr += m * s;
+            energy_mic += m * m;
+            energy_sys += s * s;
+        }
+        if energy_mic < 1e-9 || energy_sys < 1e-9 {
+            continue;
+        }
+        let norm_corr = corr / (energy_mic.sqrt() * energy_sys.sqrt());
+        if norm_corr.abs() > best_norm_corr.abs() {
+            best_norm_corr = norm_corr;
+            best_lag = lag;
+        }
+    }
+
+    (best_lag * decimation, best_norm_corr)
+}
+
 fn estimate_echo_delay(
     mic: &[f32],
     system: &[f32],
@@ -358,6 +442,8 @@ pub fn mix_down(
                 return write_mic_only(mic_path, Some(system_path), output_path, mic_samples);
             }
 
+            system_samples =
+                align_system_bleed_to_mic(system_samples, &mic_samples, TARGET_SAMPLE_RATE);
             cancel_acoustic_echo(&mut mic_samples, &system_samples, TARGET_SAMPLE_RATE);
 
             normalize_to_rms(&mut mic_samples, TARGET_RMS);
@@ -445,6 +531,41 @@ mod tests {
             .collect()
     }
 
+    fn write_float_wav(path: &Path, samples: &[f32], sample_rate: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for sample in samples {
+            writer.write_sample(*sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn make_noise(len: usize, amplitude: f32) -> Vec<f32> {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = ((state >> 40) as f32 / 0x00ff_ffffu32 as f32) * 2.0 - 1.0;
+                unit * amplitude
+            })
+            .collect()
+    }
+
+    fn read_i16_wav(path: &Path) -> Vec<f32> {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        reader
+            .samples::<i16>()
+            .map(|sample| sample.unwrap() as f32 / i16::MAX as f32)
+            .collect()
+    }
+
     #[test]
     fn cancel_acoustic_echo_removes_known_delayed_copy() {
         let sample_rate = 48_000u32;
@@ -520,6 +641,75 @@ mod tests {
         assert!(
             diff < voice_energy * 0.01,
             "expected mic to stay ~unchanged when there's no echo, diff={diff} energy={voice_energy}"
+        );
+    }
+
+    #[test]
+    fn mix_down_aligns_late_system_capture_before_echo_cancellation() {
+        let sample_rate = 48_000u32;
+        let len = sample_rate as usize * 5;
+        let system_start_offset = sample_rate as usize;
+        let acoustic_delay = 240usize;
+        let system = make_noise(len, 0.2);
+        let voice = make_complex_tone(
+            len + system_start_offset + acoustic_delay,
+            sample_rate,
+            &[233.0, 397.0, 661.0, 919.0, 1373.0, 1777.0],
+            0.12,
+        );
+
+        let mut mic = voice.clone();
+        for i in 0..system.len() {
+            let mic_index = i + system_start_offset + acoustic_delay;
+            if mic_index < mic.len() {
+                mic[mic_index] += 0.45 * system[i];
+            }
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "hyperrec_mixer_align_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let mic_path = temp_dir.join("mic.wav");
+        let system_path = temp_dir.join("system.wav");
+        let output_path = temp_dir.join("mixed.wav");
+        write_float_wav(&mic_path, &mic, sample_rate);
+        write_float_wav(&system_path, &system, sample_rate);
+
+        mix_down(&mic_path, Some(&system_path), &output_path).unwrap();
+
+        let mixed = read_i16_wav(&output_path);
+        let aligned_system = align_system_bleed_to_mic(system, &mic, sample_rate);
+        assert!(
+            (aligned_system.len() as isize
+                - (len + system_start_offset + acoustic_delay) as isize)
+                .abs()
+                < sample_rate as isize / 8,
+            "expected system track to be aligned close to the acoustic bleed"
+        );
+        let mut cleaned_mic = mic.clone();
+        cancel_acoustic_echo(&mut cleaned_mic, &aligned_system, sample_rate);
+        normalize_to_rms(&mut cleaned_mic, TARGET_RMS);
+        let mut expected_system = aligned_system.clone();
+        normalize_to_rms(&mut expected_system, TARGET_RMS);
+
+        let len = cleaned_mic.len().min(expected_system.len()).min(mixed.len());
+        let duplicate_energy: f64 = (0..len)
+            .map(|i| {
+                let expected = ((cleaned_mic[i] + expected_system[i]) * 0.85).tanh();
+                let decoded = mixed[i];
+                ((decoded - expected) as f64).powi(2)
+            })
+            .sum();
+        let signal_energy: f64 = mixed.iter().map(|&s| (s as f64).powi(2)).sum();
+
+        std::fs::remove_file(&output_path).ok();
+        std::fs::remove_dir(&temp_dir).ok();
+
+        assert!(
+            duplicate_energy < signal_energy * 0.02,
+            "expected aligned mix without large duplicate echo, duplicate={duplicate_energy}, signal={signal_energy}"
         );
     }
 }
