@@ -1,10 +1,16 @@
 //! System audio capture via Core Audio Process Taps (macOS 14.4+).
 //!
 //! Builds a private, global process tap (the whole system mix) plus a
-//! private aggregate device that combines that tap with the system
-//! default output device (used only as a hardware clock — its own audio
-//! is never recorded). An Objective-C IO block delivers PCM buffers for
-//! the aggregate device, which are written straight into a WAV file.
+//! private *tap-only* aggregate device — no real subdevice. An earlier
+//! version included the current output device as a subdevice purely to
+//! "borrow its clock", but that can make the aggregate actually drive
+//! that device's hardware: when the borrowed device is the one the user
+//! is listening through, the result is an audible echo. A tap-only
+//! aggregate clocks itself off the tap and has no such side effect, and
+//! it also sidesteps the unrelated issue where a Bluetooth headset's
+//! clock glitches when macOS switches it from A2DP to HFP. An
+//! Objective-C IO block delivers PCM buffers for the aggregate device,
+//! which are written straight into a WAV file.
 //!
 //! None of the Core Audio / Objective-C types here (`RcBlock`, tap and
 //! aggregate device ids tied to an open IO proc) are `Send`-safe to keep
@@ -27,14 +33,11 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
-    kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
-    kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapAutoStartKey,
-    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioSubDeviceUIDKey,
-    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
-    AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
-    AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
+    kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
+    kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
+    kAudioTapPropertyFormat, AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID,
+    AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
     AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
     AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectPropertyAddress,
     CATapDescription,
@@ -125,51 +128,6 @@ fn cfstr_from_cstr(s: &std::ffi::CStr) -> CFRetained<CFString> {
     cfstr(s.to_str().expect("Core Audio key constants are ASCII"))
 }
 
-unsafe fn get_u32_property(object_id: u32, selector: u32) -> std::result::Result<u32, i32> {
-    let address = AudioObjectPropertyAddress {
-        mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut size: u32 = std::mem::size_of::<u32>() as u32;
-    let mut value: u32 = 0;
-    let status = AudioObjectGetPropertyData(
-        object_id,
-        NonNull::from(&address),
-        0,
-        std::ptr::null(),
-        NonNull::from(&mut size),
-        NonNull::new(&mut value as *mut u32 as *mut c_void).unwrap(),
-    );
-    if status != 0 {
-        return Err(status);
-    }
-    Ok(value)
-}
-
-unsafe fn get_device_uid(device_id: u32) -> std::result::Result<CFRetained<CFString>, i32> {
-    let address = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyDeviceUID,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut size: u32 = std::mem::size_of::<*const c_void>() as u32;
-    let mut raw: *const c_void = std::ptr::null();
-    let status = AudioObjectGetPropertyData(
-        device_id,
-        NonNull::from(&address),
-        0,
-        std::ptr::null(),
-        NonNull::from(&mut size),
-        NonNull::new(&mut raw as *mut *const c_void as *mut c_void).unwrap(),
-    );
-    if status != 0 {
-        return Err(status);
-    }
-    let ptr = NonNull::new(raw as *mut CFString).ok_or(-1)?;
-    Ok(CFRetained::from_raw(ptr))
-}
-
 unsafe fn get_tap_format(tap_id: u32) -> std::result::Result<AudioStreamBasicDescription, i32> {
     let address = AudioObjectPropertyAddress {
         mSelector: kAudioTapPropertyFormat,
@@ -194,7 +152,9 @@ unsafe fn get_tap_format(tap_id: u32) -> std::result::Result<AudioStreamBasicDes
 
 /// Creates a private global tap + private aggregate device pair.
 /// The aggregate's only purpose is to host the tap's input stream and to
-/// borrow a real hardware clock from the system default output device.
+/// borrow a real hardware clock — preferably a built-in device, since a
+/// Bluetooth headset's clock can glitch when its profile switches (see
+/// `find_stable_clock_device`).
 unsafe fn create_tap_and_aggregate() -> std::result::Result<(u32, u32, String), String> {
     let exclude: Retained<NSArray<NSNumber>> = NSArray::from_slice(&[]);
     let description =
@@ -210,28 +170,6 @@ unsafe fn create_tap_and_aggregate() -> std::result::Result<(u32, u32, String), 
         return Err(format!("AudioHardwareCreateProcessTap failed: OSStatus={status}"));
     }
 
-    let output_device_id =
-        match get_u32_property(kAudioObjectSystemObject as u32, kAudioHardwarePropertyDefaultOutputDevice) {
-            Ok(id) => id,
-            Err(e) => {
-                AudioHardwareDestroyProcessTap(tap_id);
-                return Err(format!("could not resolve default output device: OSStatus={e}"));
-            }
-        };
-    let output_uid_string = match get_device_uid(output_device_id) {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            AudioHardwareDestroyProcessTap(tap_id);
-            return Err(format!("could not resolve default output device UID: OSStatus={e}"));
-        }
-    };
-
-    let sub_device_dict = CFDictionary::from_slices(
-        &[&*cfstr_from_cstr(kAudioSubDeviceUIDKey)],
-        &[cft(&cfstr(&output_uid_string))],
-    );
-    let sub_device_list = CFArray::from_objects(&[&*sub_device_dict]);
-
     let tap_dict = CFDictionary::from_slices(
         &[
             &*cfstr_from_cstr(kAudioSubTapUIDKey),
@@ -241,6 +179,11 @@ unsafe fn create_tap_and_aggregate() -> std::result::Result<(u32, u32, String), 
     );
     let tap_list = CFArray::from_objects(&[&*tap_dict]);
 
+    // No real subdevice on purpose: including one (even just to "borrow
+    // its clock") can make the aggregate actually drive that device's
+    // hardware, which is audible as an echo/duplication when it happens
+    // to be the speaker the user is listening through right now. A
+    // tap-only aggregate clocks itself off the tap and avoids that.
     let aggregate_uid = format!("com.zeitgewinn.hyperrec.system-audio-tap.{tap_uid_string}");
     let aggregate_description = CFDictionary::from_slices(
         &[
@@ -249,8 +192,6 @@ unsafe fn create_tap_and_aggregate() -> std::result::Result<(u32, u32, String), 
             &*cfstr_from_cstr(kAudioAggregateDeviceIsPrivateKey),
             &*cfstr_from_cstr(kAudioAggregateDeviceIsStackedKey),
             &*cfstr_from_cstr(kAudioAggregateDeviceTapAutoStartKey),
-            &*cfstr_from_cstr(kAudioAggregateDeviceMainSubDeviceKey),
-            &*cfstr_from_cstr(kAudioAggregateDeviceSubDeviceListKey),
             &*cfstr_from_cstr(kAudioAggregateDeviceTapListKey),
         ],
         &[
@@ -259,8 +200,6 @@ unsafe fn create_tap_and_aggregate() -> std::result::Result<(u32, u32, String), 
             cft(CFBoolean::new(true)),
             cft(CFBoolean::new(false)),
             cft(CFBoolean::new(true)),
-            cft(&cfstr(&output_uid_string)),
-            cft(&sub_device_list),
             cft(&tap_list),
         ],
     );
@@ -274,7 +213,6 @@ unsafe fn create_tap_and_aggregate() -> std::result::Result<(u32, u32, String), 
         AudioHardwareDestroyProcessTap(tap_id);
         return Err(format!("AudioHardwareCreateAggregateDevice failed: OSStatus={agg_status}"));
     }
-
     Ok((tap_id, aggregate_device_id, tap_uid_string))
 }
 
