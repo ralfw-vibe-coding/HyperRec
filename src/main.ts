@@ -37,6 +37,7 @@ let statusMessageEl: HTMLElement | null;
 
 let uiState: UiState = "ready";
 let pollHandle: number | null = null;
+let pollGeneration = 0;
 let busy = false;
 
 function formatElapsed(totalSeconds: number): string {
@@ -59,11 +60,23 @@ function setUiState(next: UiState) {
 
   const showsDeviceSelects = next === "ready" || next === "paused";
   const height = showsDeviceSelects ? WINDOW_HEIGHT_WITH_SELECTS : WINDOW_HEIGHT_WITHOUT_SELECTS;
-  getCurrentWindow()
-    .setSize(new LogicalSize(WINDOW_WIDTH, height))
-    .catch(() => {
-      // window may not be ready yet on the very first call; harmless
-    });
+  applyWindowSize(height);
+}
+
+async function applyWindowSize(height: number) {
+  const appWindow = getCurrentWindow();
+  const size = new LogicalSize(WINDOW_WIDTH, height);
+  try {
+    await appWindow.setResizable(false);
+    await appWindow.setMinSize(null);
+    await appWindow.setMaxSize(null);
+    await appWindow.setSize(size);
+    await appWindow.setMinSize(size);
+    await appWindow.setMaxSize(size);
+    await appWindow.setResizable(false);
+  } catch {
+    // window may not be ready yet on the very first call; harmless
+  }
 }
 
 function setPauseIcon(isPaused: boolean) {
@@ -111,9 +124,11 @@ async function loadDevices() {
   }
 }
 
-async function pollTimer() {
+async function pollTimer(generation: number) {
   try {
     const elapsed = await invoke<number>("recording_elapsed_seconds");
+    if (generation !== pollGeneration || pollHandle === null) return;
+    if (uiState !== "recording" && uiState !== "paused") return;
     if (timerEl) timerEl.textContent = formatElapsed(elapsed);
   } catch {
     // ignore transient errors while the backend is mid-transition
@@ -122,11 +137,13 @@ async function pollTimer() {
 
 function startPolling() {
   stopPolling();
-  pollHandle = window.setInterval(pollTimer, 250);
-  pollTimer();
+  const generation = ++pollGeneration;
+  pollHandle = window.setInterval(() => pollTimer(generation), 250);
+  pollTimer(generation);
 }
 
 function stopPolling() {
+  pollGeneration++;
   if (pollHandle !== null) {
     window.clearInterval(pollHandle);
     pollHandle = null;
@@ -147,6 +164,7 @@ async function startRecording() {
   await withBusyGuard(async () => {
     if (!inputSelect || !outputSelect) return;
     try {
+      if (timerEl) timerEl.textContent = "00:00:00";
       await invoke("start_recording", {
         inputDeviceId: inputSelect.value,
         outputDeviceId: outputSelect.value,
@@ -182,12 +200,13 @@ async function togglePauseResume() {
 async function stopRecording() {
   await withBusyGuard(async () => {
     try {
-      const result = await invoke<RecordingResult>("stop_recording");
       stopPolling();
-      if (timerEl) timerEl.textContent = formatElapsed(result.duration_seconds);
+      const result = await invoke<RecordingResult>("stop_recording");
       setUiState("recorded");
+      if (timerEl) timerEl.textContent = formatElapsed(result.duration_seconds);
       setStatus("");
     } catch (error) {
+      if (uiState === "recording" || uiState === "paused") startPolling();
       setStatus(`Stop fehlgeschlagen: ${error}`);
     }
   });
