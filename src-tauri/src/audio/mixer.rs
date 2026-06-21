@@ -54,44 +54,79 @@ fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 /// Without headphones, the microphone picks up the speaker acoustically
 /// in addition to the system tap capturing it digitally — the same
 /// audio ends up in the mix twice, heard as an echo. Since we already
-/// have the system signal digitally, we can estimate how it leaked into
-/// the mic (a fixed acoustic delay + gain, reasonable for a stationary
-/// laptop/desk setup) via cross-correlation over a short window, then
-/// subtract a delayed+scaled copy of it from the mic track before
-/// mixing. Not full adaptive AEC, but needs no extra dependencies and
-/// runs once as a post-processing step.
+/// have the system signal digitally, estimate the acoustic echo path and
+/// subtract it from the mic before mixing.
+///
+/// MacBook speakers are not just "one delayed copy": CoreAudio, speaker
+/// DSP, room reflections, and the microphone response smear the signal.
+/// So this uses a small frame-wise FIR model around the detected delay
+/// rather than the earlier single delay/gain estimate.
 fn cancel_acoustic_echo(mic: &mut [f32], system: &[f32], sample_rate: u32) {
-    const MAX_DELAY_MS: f64 = 40.0;
-    const ANALYSIS_SECONDS: f64 = 2.0;
-    // Picking whichever delay has the single largest raw correlation is
-    // not enough: over ~2000 candidate delays, pure chance alone throws
-    // up a "biggest" one even for two genuinely unrelated signals. Only
-    // trust it as real echo if the *normalized* (Pearson-style)
-    // correlation clears a real threshold, comfortably above chance
-    // level and comfortably below what real leaked echo produces.
-    const MIN_NORMALIZED_CORRELATION: f64 = 0.15;
+    const MAX_DELAY_MS: f64 = 120.0;
+    const ANALYSIS_SECONDS: f64 = 4.0;
+    const DELAY_SEARCH_DECIMATION: usize = 8;
+    const MIN_DELAY_CORRELATION: f64 = 0.08;
+    const MIN_FRAME_EXPLAINED_CORRELATION: f64 = 0.12;
 
     let max_delay = ((sample_rate as f64 * MAX_DELAY_MS) / 1000.0) as usize;
-    let window = ((sample_rate as f64 * ANALYSIS_SECONDS) as usize).min(mic.len()).min(system.len());
-    if window == 0 || max_delay == 0 || window <= max_delay * 2 {
+    let analysis_len = ((sample_rate as f64 * ANALYSIS_SECONDS) as usize)
+        .min(mic.len())
+        .min(system.len());
+    if analysis_len == 0 || max_delay == 0 || analysis_len <= max_delay * 2 {
         return;
     }
 
-    let mic_win = &mic[..window];
-    let sys_win = &system[..window];
+    let (best_delay, best_corr) = estimate_echo_delay(
+        &mic[..analysis_len],
+        &system[..analysis_len],
+        max_delay,
+        DELAY_SEARCH_DECIMATION,
+    );
+    if best_corr.abs() < MIN_DELAY_CORRELATION {
+        return;
+    }
+
+    let reflection_offsets = reflection_offsets(sample_rate);
+    let frame_len = ((sample_rate as f64 * 0.05) as usize).max(512);
+    let hop_len = frame_len;
+
+    let mut start = best_delay;
+    while start < mic.len() {
+        let end = (start + frame_len).min(mic.len()).min(system.len() + best_delay);
+        if end <= start {
+            break;
+        }
+        subtract_echo_frame(
+            mic,
+            system,
+            start,
+            end,
+            best_delay,
+            &reflection_offsets,
+            MIN_FRAME_EXPLAINED_CORRELATION,
+        );
+        start += hop_len;
+    }
+}
+
+fn estimate_echo_delay(mic: &[f32], system: &[f32], max_delay: usize, decimation: usize) -> (usize, f64) {
+    let decimation = decimation.max(1);
+    let max_delay_decimated = max_delay / decimation;
+    let len_decimated = mic.len().min(system.len()) / decimation;
+    if len_decimated <= max_delay_decimated + 1 {
+        return (0, 0.0);
+    }
 
     let mut best_delay = 0usize;
     let mut best_norm_corr = 0.0f64;
-    let mut best_corr = 0.0f64;
-    let mut best_energy_sys = 0.0f64;
 
-    for delay in 0..max_delay {
+    for delay in 0..=max_delay_decimated {
         let mut corr = 0.0f64;
         let mut energy_mic = 0.0f64;
         let mut energy_sys = 0.0f64;
-        for i in delay..window {
-            let m = mic_win[i] as f64;
-            let s = sys_win[i - delay] as f64;
+        for i in delay..len_decimated {
+            let m = mic[i * decimation] as f64;
+            let s = system[(i - delay) * decimation] as f64;
             corr += m * s;
             energy_mic += m * m;
             energy_sys += s * s;
@@ -102,30 +137,150 @@ fn cancel_acoustic_echo(mic: &mut [f32], system: &[f32], sample_rate: u32) {
         let norm_corr = corr / (energy_mic.sqrt() * energy_sys.sqrt());
         if norm_corr.abs() > best_norm_corr.abs() {
             best_norm_corr = norm_corr;
-            best_delay = delay;
-            best_corr = corr;
-            best_energy_sys = energy_sys;
+            best_delay = delay * decimation;
         }
     }
 
-    // Not echo-like enough (e.g. recording with headphones, nothing to
-    // remove) — leave the mic alone rather than risk subtracting noise.
-    if best_norm_corr.abs() < MIN_NORMALIZED_CORRELATION || best_energy_sys < 1e-9 {
+    (best_delay, best_norm_corr)
+}
+
+fn reflection_offsets(sample_rate: u32) -> Vec<usize> {
+    [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+        .iter()
+        .map(|ms| ((sample_rate as f64 * ms) / 1000.0).round() as usize)
+        .collect()
+}
+
+fn subtract_echo_frame(
+    mic: &mut [f32],
+    system: &[f32],
+    start: usize,
+    end: usize,
+    base_delay: usize,
+    offsets: &[usize],
+    min_explained_correlation: f64,
+) {
+    const RIDGE: f64 = 1e-5;
+    const MAX_COEFFICIENT: f64 = 2.0;
+
+    let n = offsets.len();
+    if n == 0 {
         return;
     }
 
-    let gain = best_corr / best_energy_sys;
-    if gain <= 0.0 {
-        return;
-    }
+    let mut gram = vec![vec![0.0f64; n]; n];
+    let mut rhs = vec![0.0f64; n];
+    let mut mic_energy = 0.0f64;
 
-    for (i, sample) in mic.iter_mut().enumerate() {
-        if i >= best_delay {
-            if let Some(&reference) = system.get(i - best_delay) {
-                *sample -= (gain * reference as f64) as f32;
+    for i in start..end {
+        let m = mic[i] as f64;
+        mic_energy += m * m;
+        for (a, &offset_a) in offsets.iter().enumerate() {
+            let Some(sa) = i
+                .checked_sub(base_delay + offset_a)
+                .and_then(|idx| system.get(idx))
+                .map(|&s| s as f64)
+            else {
+                continue;
+            };
+            rhs[a] += m * sa;
+            for (b, &offset_b) in offsets.iter().enumerate() {
+                if let Some(sb) = i
+                    .checked_sub(base_delay + offset_b)
+                    .and_then(|idx| system.get(idx))
+                    .map(|&s| s as f64)
+                {
+                    gram[a][b] += sa * sb;
+                }
             }
         }
     }
+
+    if mic_energy < 1e-9 {
+        return;
+    }
+
+    for (i, row) in gram.iter_mut().enumerate() {
+        row[i] += RIDGE;
+    }
+
+    let Some(mut coefficients) = solve_linear_system(gram, rhs) else {
+        return;
+    };
+    for coefficient in &mut coefficients {
+        *coefficient = coefficient.clamp(-MAX_COEFFICIENT, MAX_COEFFICIENT);
+    }
+
+    let mut echo_energy = 0.0f64;
+    let mut mic_echo_dot = 0.0f64;
+    let mut echo = vec![0.0f64; end - start];
+    for (out_idx, i) in (start..end).enumerate() {
+        let mut predicted = 0.0f64;
+        for (&coefficient, &offset) in coefficients.iter().zip(offsets.iter()) {
+            if let Some(reference) = i
+                .checked_sub(base_delay + offset)
+                .and_then(|idx| system.get(idx))
+            {
+                predicted += coefficient * *reference as f64;
+            }
+        }
+        echo[out_idx] = predicted;
+        echo_energy += predicted * predicted;
+        mic_echo_dot += mic[i] as f64 * predicted;
+    }
+
+    if echo_energy < 1e-9 {
+        return;
+    }
+    let explained_corr = mic_echo_dot.abs() / (mic_energy.sqrt() * echo_energy.sqrt());
+    if explained_corr < min_explained_correlation {
+        return;
+    }
+
+    for (out_idx, i) in (start..end).enumerate() {
+        mic[i] -= echo[out_idx] as f32;
+    }
+}
+
+fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&r1, &r2| {
+            a[r1][col]
+                .abs()
+                .partial_cmp(&a[r2][col].abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        if pivot != col {
+            a.swap(pivot, col);
+            b.swap(pivot, col);
+        }
+
+        let pivot_value = a[col][col];
+        for c in col..n {
+            a[col][c] /= pivot_value;
+        }
+        b[col] /= pivot_value;
+
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let factor = a[r][col];
+            if factor.abs() < 1e-15 {
+                continue;
+            }
+            for c in col..n {
+                a[r][c] -= factor * a[col][c];
+            }
+            b[r] -= factor * b[col];
+        }
+    }
+
+    Some(b)
 }
 
 fn rms(samples: &[f32]) -> f32 {
