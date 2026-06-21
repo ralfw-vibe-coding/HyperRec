@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use super::{AudioError, RecordingResult, Result};
 
 const TARGET_SAMPLE_RATE: u32 = 48_000;
-const TARGET_RMS: f32 = 0.1;
+const TARGET_RMS: f32 = 0.07;
 
 fn read_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let mut reader = hound::WavReader::open(path).map_err(|e| AudioError::Backend(e.to_string()))?;
+    let mut reader =
+        hound::WavReader::open(path).map_err(|e| AudioError::Backend(e.to_string()))?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
     let raw: Vec<f32> = reader
@@ -92,7 +93,9 @@ fn cancel_acoustic_echo(mic: &mut [f32], system: &[f32], sample_rate: u32) {
 
     let mut start = best_delay;
     while start < mic.len() {
-        let end = (start + frame_len).min(mic.len()).min(system.len() + best_delay);
+        let end = (start + frame_len)
+            .min(mic.len())
+            .min(system.len() + best_delay);
         if end <= start {
             break;
         }
@@ -109,7 +112,12 @@ fn cancel_acoustic_echo(mic: &mut [f32], system: &[f32], sample_rate: u32) {
     }
 }
 
-fn estimate_echo_delay(mic: &[f32], system: &[f32], max_delay: usize, decimation: usize) -> (usize, f64) {
+fn estimate_echo_delay(
+    mic: &[f32],
+    system: &[f32],
+    max_delay: usize,
+    decimation: usize,
+) -> (usize, f64) {
     let decimation = decimation.max(1);
     let max_delay_decimated = max_delay / decimation;
     let len_decimated = mic.len().min(system.len()) / decimation;
@@ -291,6 +299,10 @@ fn rms(samples: &[f32]) -> f32 {
     ((sum_sq / samples.len() as f64).sqrt()) as f32
 }
 
+fn has_audible_signal(samples: &[f32]) -> bool {
+    rms(samples) >= 1e-4 || samples.iter().any(|s| s.abs() >= 1e-3)
+}
+
 /// Scales `samples` so their RMS matches `target`. Leaves near-silence
 /// alone instead of blowing up noise floor into audible hiss.
 fn normalize_to_rms(samples: &mut [f32], target: f32) {
@@ -311,28 +323,40 @@ fn write_mono_i16_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(path, spec).map_err(|e| AudioError::Backend(e.to_string()))?;
+    let mut writer =
+        hound::WavWriter::create(path, spec).map_err(|e| AudioError::Backend(e.to_string()))?;
     for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
+        let clamped = (s * 0.85).tanh().clamp(-1.0, 1.0);
         writer
             .write_sample((clamped * i16::MAX as f32) as i16)
             .map_err(|e| AudioError::Backend(e.to_string()))?;
     }
-    writer.finalize().map_err(|e| AudioError::Backend(e.to_string()))
+    writer
+        .finalize()
+        .map_err(|e| AudioError::Backend(e.to_string()))
 }
 
 /// Mixes the mic track with the system-audio track (if any) into
 /// `output_path` as a 48kHz/16-bit mono WAV, deleting the two raw input
 /// files afterwards. Falls back to a plain resample of the mic track
 /// when there is no system audio to mix in (e.g. it failed to start).
-pub fn mix_down(mic_path: &Path, system_path: Option<&Path>, output_path: &Path) -> Result<RecordingResult> {
+pub fn mix_down(
+    mic_path: &Path,
+    system_path: Option<&Path>,
+    output_path: &Path,
+) -> Result<RecordingResult> {
     let (mic_samples, mic_rate) = read_mono_f32(mic_path)?;
     let mut mic_samples = resample_linear(&mic_samples, mic_rate, TARGET_SAMPLE_RATE);
 
     let mixed = match system_path {
         Some(system_path) => {
             let (system_samples, system_rate) = read_mono_f32(system_path)?;
-            let mut system_samples = resample_linear(&system_samples, system_rate, TARGET_SAMPLE_RATE);
+            let mut system_samples =
+                resample_linear(&system_samples, system_rate, TARGET_SAMPLE_RATE);
+            if !has_audible_signal(&system_samples) {
+                eprintln!("HyperRec: system audio track was silent; using microphone only");
+                return write_mic_only(mic_path, Some(system_path), output_path, mic_samples);
+            }
 
             cancel_acoustic_echo(&mut mic_samples, &system_samples, TARGET_SAMPLE_RATE);
 
@@ -364,6 +388,23 @@ pub fn mix_down(mic_path: &Path, system_path: Option<&Path>, output_path: &Path)
     })
 }
 
+fn write_mic_only(
+    mic_path: &Path,
+    system_path: Option<&Path>,
+    output_path: &Path,
+    mic_samples: Vec<f32>,
+) -> Result<RecordingResult> {
+    write_mono_i16_wav(output_path, &mic_samples, TARGET_SAMPLE_RATE)?;
+    std::fs::remove_file(mic_path).ok();
+    if let Some(system_path) = system_path {
+        std::fs::remove_file(system_path).ok();
+    }
+    Ok(RecordingResult {
+        temp_file_path: output_path.to_path_buf(),
+        duration_seconds: mic_samples.len() as f64 / TARGET_SAMPLE_RATE as f64,
+    })
+}
+
 pub fn timestamped_path(dir: &Path, prefix: &str) -> PathBuf {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -384,13 +425,20 @@ mod tests {
     /// correlation peak like real broadband audio does, while staying
     /// fully deterministic (unlike "two seeds of one PRNG", which can
     /// carry subtle shared structure despite looking unrelated).
-    fn make_complex_tone(len: usize, sample_rate: u32, freqs_hz: &[f32], amplitude: f32) -> Vec<f32> {
+    fn make_complex_tone(
+        len: usize,
+        sample_rate: u32,
+        freqs_hz: &[f32],
+        amplitude: f32,
+    ) -> Vec<f32> {
         let scale = amplitude / freqs_hz.len() as f32;
         (0..len)
             .map(|i| {
                 freqs_hz
                     .iter()
-                    .map(|&f| (2.0 * std::f32::consts::PI * f * i as f32 / sample_rate as f32).sin())
+                    .map(|&f| {
+                        (2.0 * std::f32::consts::PI * f * i as f32 / sample_rate as f32).sin()
+                    })
                     .sum::<f32>()
                     * scale
             })
@@ -401,8 +449,18 @@ mod tests {
     fn cancel_acoustic_echo_removes_known_delayed_copy() {
         let sample_rate = 48_000u32;
         let len = sample_rate as usize * 2;
-        let system = make_complex_tone(len, sample_rate, &[311.0, 547.0, 877.0, 1231.0, 1607.0, 1999.0], 0.4);
-        let voice = make_complex_tone(len, sample_rate, &[233.0, 397.0, 661.0, 919.0, 1373.0, 1777.0], 0.3);
+        let system = make_complex_tone(
+            len,
+            sample_rate,
+            &[311.0, 547.0, 877.0, 1231.0, 1607.0, 1999.0],
+            0.4,
+        );
+        let voice = make_complex_tone(
+            len,
+            sample_rate,
+            &[233.0, 397.0, 661.0, 919.0, 1373.0, 1777.0],
+            0.3,
+        );
 
         let delay = 200usize;
         let leak_gain = 0.35f32;
@@ -414,8 +472,16 @@ mod tests {
         let mic_before = mic.clone();
         cancel_acoustic_echo(&mut mic, &system, sample_rate);
 
-        let error_before: f64 = voice.iter().zip(mic_before.iter()).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
-        let error_after: f64 = voice.iter().zip(mic.iter()).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let error_before: f64 = voice
+            .iter()
+            .zip(mic_before.iter())
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
+        let error_after: f64 = voice
+            .iter()
+            .zip(mic.iter())
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
 
         println!("error_before={error_before:.4} error_after={error_after:.4}");
         assert!(
@@ -428,13 +494,27 @@ mod tests {
     fn cancel_acoustic_echo_leaves_clean_mic_alone_without_echo() {
         let sample_rate = 48_000u32;
         let len = sample_rate as usize * 2;
-        let system = make_complex_tone(len, sample_rate, &[311.0, 547.0, 877.0, 1231.0, 1607.0, 1999.0], 0.4);
-        let voice = make_complex_tone(len, sample_rate, &[233.0, 397.0, 661.0, 919.0, 1373.0, 1777.0], 0.3);
+        let system = make_complex_tone(
+            len,
+            sample_rate,
+            &[311.0, 547.0, 877.0, 1231.0, 1607.0, 1999.0],
+            0.4,
+        );
+        let voice = make_complex_tone(
+            len,
+            sample_rate,
+            &[233.0, 397.0, 661.0, 919.0, 1373.0, 1777.0],
+            0.3,
+        );
         let mut mic = voice.clone();
 
         cancel_acoustic_echo(&mut mic, &system, sample_rate);
 
-        let diff: f64 = voice.iter().zip(mic.iter()).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let diff: f64 = voice
+            .iter()
+            .zip(mic.iter())
+            .map(|(a, b)| ((a - b) as f64).powi(2))
+            .sum();
         let voice_energy: f64 = voice.iter().map(|&v| (v as f64).powi(2)).sum();
         println!("diff={diff:.4} voice_energy={voice_energy:.4}");
         assert!(

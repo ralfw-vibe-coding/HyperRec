@@ -36,4 +36,12 @@ objc2-core-audio-types = "0.3"
 objc2-foundation = "0.3"
 objc2-core-foundation = "0.3"
 block2 = "0.6"
-
+dispatch2 = "0.3"
+objc2-core-media = "0.3"
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+    "SCShareableContent",
+    "SCStream",
+] }

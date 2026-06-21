@@ -11,14 +11,18 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::mac_system_audio::SystemAudioRecorder;
-use super::{AudioDevice, AudioError, AudioProvider, PermissionStatus, RecordingConfig, RecordingResult, Result};
+use super::{
+    AudioDevice, AudioError, AudioProvider, PermissionStatus, RecordingConfig, RecordingResult,
+    Result,
+};
 
 type WavWriter = hound::WavWriter<BufWriter<File>>;
 
@@ -41,16 +45,41 @@ impl RecorderHandle {
     }
 }
 
+struct PendingSystemAudio {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<SystemAudioRecorder>>,
+}
+
 #[derive(Default)]
 pub struct MacAudioProvider {
     mic: Option<RecorderHandle>,
     system_audio: Option<SystemAudioRecorder>,
+    pending_system_audio: Option<PendingSystemAudio>,
     final_path: Option<PathBuf>,
 }
 
 impl MacAudioProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn collect_ready_system_audio(&mut self) {
+        let Some(pending) = self.pending_system_audio.take() else {
+            return;
+        };
+
+        match pending.rx.try_recv() {
+            Ok(Ok(recorder)) => {
+                self.system_audio = Some(recorder);
+            }
+            Ok(Err(e)) => {
+                eprintln!("HyperRec: system audio capture unavailable: {e}");
+            }
+            Err(TryRecvError::Empty) => {
+                self.pending_system_audio = Some(pending);
+            }
+            Err(TryRecvError::Disconnected) => {}
+        }
     }
 
     fn find_input_device(device_id: &Option<String>) -> Result<cpal::Device> {
@@ -66,6 +95,44 @@ impl MacAudioProvider {
                 .ok_or_else(|| AudioError::DeviceNotFound("no default input device".into())),
         }
     }
+}
+
+fn stop_and_discard_system_audio(recorder: Option<SystemAudioRecorder>) {
+    if let Some(recorder) = recorder {
+        if let Ok(result) = recorder.stop() {
+            std::fs::remove_file(result.temp_file_path).ok();
+        }
+    }
+}
+
+fn start_system_audio_in_background(
+    temp_file_path: PathBuf,
+    output_device_uid: Option<String>,
+) -> PendingSystemAudio {
+    let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_thread = cancel.clone();
+
+    std::thread::Builder::new()
+        .name("hyperrec-system-audio-starter".into())
+        .spawn(move || match SystemAudioRecorder::start(temp_file_path, output_device_uid) {
+            Ok(recorder) if cancel_for_thread.load(Ordering::Relaxed) => {
+                stop_and_discard_system_audio(Some(recorder));
+            }
+            Ok(recorder) => {
+                if let Err(err) = tx.send(Ok(recorder)) {
+                    if let Ok(recorder) = err.0 {
+                        stop_and_discard_system_audio(Some(recorder));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        })
+        .ok();
+
+    PendingSystemAudio { cancel, rx }
 }
 
 // cpal has no stable hardware device ID on macOS without dropping to Core
@@ -220,12 +287,7 @@ impl AudioProvider for MacAudioProvider {
     fn list_output_devices(&self) -> Result<Vec<AudioDevice>> {
         let host = cpal::default_host();
         let default_name = host.default_output_device().and_then(|d| d.name().ok());
-        let devices = host
-            .output_devices()
-            .map_err(|e| AudioError::Backend(e.to_string()))?;
-        devices
-            .map(|d| to_audio_device(&d, default_name.as_deref()))
-            .collect()
+        super::mac_system_audio::list_coreaudio_output_devices(default_name.as_deref())
     }
 
     fn default_input_device(&self) -> Result<AudioDevice> {
@@ -259,14 +321,27 @@ impl AudioProvider for MacAudioProvider {
             return Err(AudioError::InvalidState("recording already active".into()));
         }
 
-        let device = Self::find_input_device(&config.input_device_id)?;
-        let supported_config = device
-            .default_input_config()
-            .map_err(|e| AudioError::Backend(e.to_string()))?;
+        std::fs::create_dir_all(&config.temp_dir)?;
+
+        let mut system_audio = None;
+
+        let device = match Self::find_input_device(&config.input_device_id) {
+            Ok(device) => device,
+            Err(e) => {
+                stop_and_discard_system_audio(system_audio.take());
+                return Err(e);
+            }
+        };
+        let supported_config = match device.default_input_config() {
+            Ok(config) => config,
+            Err(e) => {
+                stop_and_discard_system_audio(system_audio.take());
+                return Err(AudioError::Backend(e.to_string()));
+            }
+        };
         let sample_format = supported_config.sample_format();
         let stream_config: cpal::StreamConfig = supported_config.into();
 
-        std::fs::create_dir_all(&config.temp_dir)?;
         let mic_temp_path = super::mixer::timestamped_path(&config.temp_dir, "mic");
 
         let spec = hound::WavSpec {
@@ -292,34 +367,40 @@ impl AudioProvider for MacAudioProvider {
                     control_rx,
                 )
             })
-            .map_err(|e| AudioError::Backend(e.to_string()))?;
+            .map_err(|e| {
+                stop_and_discard_system_audio(system_audio.take());
+                AudioError::Backend(e.to_string())
+            })?;
 
-        ready_rx
+        match ready_rx
             .recv()
-            .map_err(|_| AudioError::Backend("recorder thread did not start".into()))??;
+            .map_err(|_| AudioError::Backend("recorder thread did not start".into()))
+            .and_then(|result| result)
+        {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = join_handle.join();
+                stop_and_discard_system_audio(system_audio.take());
+                return Err(e);
+            }
+        }
 
         self.mic = Some(RecorderHandle {
             control_tx,
             join_handle: Some(join_handle),
         });
-
-        // Best-effort: a recording with just the microphone is still
-        // useful, so a failure here (e.g. macOS < 14.4) does not abort
-        // the whole recording — it only drops system audio from the mix.
-        let system_temp_path = super::mixer::timestamped_path(&config.temp_dir, "system");
-        match SystemAudioRecorder::start(system_temp_path) {
-            Ok(recorder) => self.system_audio = Some(recorder),
-            Err(e) => {
-                eprintln!("HyperRec: system audio capture unavailable, recording microphone only: {e}");
-                self.system_audio = None;
-            }
-        }
+        self.system_audio = system_audio.take();
+        self.pending_system_audio = Some(start_system_audio_in_background(
+            super::mixer::timestamped_path(&config.temp_dir, "system"),
+            config.output_device_id.clone(),
+        ));
 
         self.final_path = Some(super::mixer::timestamped_path(&config.temp_dir, "hyperrec"));
         Ok(())
     }
 
     fn pause_recording(&mut self) -> Result<()> {
+        self.collect_ready_system_audio();
         let mic = self
             .mic
             .as_ref()
@@ -337,6 +418,7 @@ impl AudioProvider for MacAudioProvider {
     }
 
     fn resume_recording(&mut self) -> Result<()> {
+        self.collect_ready_system_audio();
         let mic = self
             .mic
             .as_ref()
@@ -354,6 +436,7 @@ impl AudioProvider for MacAudioProvider {
     }
 
     fn stop_recording(&mut self) -> Result<RecordingResult> {
+        self.collect_ready_system_audio();
         let mut mic = self
             .mic
             .take()
@@ -368,6 +451,25 @@ impl AudioProvider for MacAudioProvider {
         })();
         if let Some(handle) = mic.join_handle.take() {
             let _ = handle.join();
+        }
+
+        if let Some(pending) = self.pending_system_audio.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+            match pending.rx.recv_timeout(Duration::from_millis(1500)) {
+                Ok(Ok(recorder)) => {
+                    eprintln!("HyperRec: system audio recorder became ready before stop");
+                    self.system_audio = Some(recorder);
+                }
+                Ok(Err(e)) => {
+                    eprintln!("HyperRec: system audio capture unavailable: {e}");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!("HyperRec: system audio recorder was not ready before stop");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!("HyperRec: system audio starter disappeared before stop");
+                }
+            }
         }
 
         // Always tear down system audio, even if the mic failed, so its
@@ -389,7 +491,11 @@ impl AudioProvider for MacAudioProvider {
             .final_path
             .take()
             .ok_or_else(|| AudioError::Backend("missing output path".into()))?;
-        super::mixer::mix_down(&mic_result.temp_file_path, system_path.as_deref(), &final_path)
+        super::mixer::mix_down(
+            &mic_result.temp_file_path,
+            system_path.as_deref(),
+            &final_path,
+        )
     }
 }
 
@@ -407,18 +513,23 @@ mod tests {
             temp_dir: temp_dir.clone(),
         };
 
-        provider.start_recording(config).expect("start_recording failed");
+        provider
+            .start_recording(config)
+            .expect("start_recording failed");
         std::thread::sleep(std::time::Duration::from_millis(500));
         provider.pause_recording().expect("pause_recording failed");
         std::thread::sleep(std::time::Duration::from_millis(300));
-        provider.resume_recording().expect("resume_recording failed");
+        provider
+            .resume_recording()
+            .expect("resume_recording failed");
         std::thread::sleep(std::time::Duration::from_millis(500));
         let result = provider.stop_recording().expect("stop_recording failed");
 
         assert!(result.temp_file_path.exists(), "wav file should exist");
         assert!(result.duration_seconds > 0.0, "duration should be > 0");
 
-        let reader = hound::WavReader::open(&result.temp_file_path).expect("wav should be readable");
+        let reader =
+            hound::WavReader::open(&result.temp_file_path).expect("wav should be readable");
         let spec = reader.spec();
         assert!(spec.sample_rate > 0);
         println!(
@@ -439,8 +550,13 @@ mod tests {
             temp_dir: temp_dir.clone(),
         };
 
-        provider.start_recording(config).expect("start_recording failed");
-        assert!(provider.system_audio.is_some(), "system audio should have started");
+        provider
+            .start_recording(config)
+            .expect("start_recording failed");
+        assert!(
+            provider.system_audio.is_some(),
+            "system audio should have started"
+        );
 
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -463,14 +579,18 @@ mod tests {
             .collect();
         assert_eq!(leftovers, vec![result.temp_file_path.clone()]);
 
-        let mut reader = hound::WavReader::open(&result.temp_file_path).expect("mixed wav should be readable");
+        let mut reader =
+            hound::WavReader::open(&result.temp_file_path).expect("mixed wav should be readable");
         let spec = reader.spec();
         assert_eq!(spec.sample_rate, 48_000);
         assert_eq!(spec.bits_per_sample, 16);
         let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
         let max_amplitude = samples.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
         println!("mixed file: {:?}, max amplitude {}", spec, max_amplitude);
-        assert!(max_amplitude > 1000, "expected audible signal in mixed output, got {max_amplitude}");
+        assert!(
+            max_amplitude > 1000,
+            "expected audible signal in mixed output, got {max_amplitude}"
+        );
 
         std::fs::remove_file(&result.temp_file_path).ok();
     }
@@ -485,13 +605,19 @@ mod tests {
             temp_dir: temp_dir.clone(),
         };
 
-        provider.start_recording(config).expect("start_recording failed");
+        provider
+            .start_recording(config)
+            .expect("start_recording failed");
 
         for i in 0..4 {
             std::thread::sleep(std::time::Duration::from_millis(150));
-            provider.pause_recording().unwrap_or_else(|e| panic!("pause #{i} failed: {e}"));
+            provider
+                .pause_recording()
+                .unwrap_or_else(|e| panic!("pause #{i} failed: {e}"));
             std::thread::sleep(std::time::Duration::from_millis(100));
-            provider.resume_recording().unwrap_or_else(|e| panic!("resume #{i} failed: {e}"));
+            provider
+                .resume_recording()
+                .unwrap_or_else(|e| panic!("resume #{i} failed: {e}"));
         }
 
         std::thread::sleep(std::time::Duration::from_millis(150));
