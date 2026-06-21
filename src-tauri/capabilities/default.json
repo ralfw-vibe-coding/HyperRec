@@ -10,6 +10,7 @@
     "core:window:allow-set-min-size",
     "core:window:allow-set-resizable",
     "core:window:allow-set-size",
-    "opener:default"
+    "opener:default",
+    "clipboard-manager:allow-write-text"
   ]
 }

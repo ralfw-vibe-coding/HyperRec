@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 type UiState = "ready" | "recording" | "paused" | "recorded";
 
@@ -29,6 +30,7 @@ let timerEl: HTMLElement | null;
 let recordButton: HTMLButtonElement | null;
 let stopButton: HTMLButtonElement | null;
 let pauseResumeButton: HTMLButtonElement | null;
+let copyPathButton: HTMLButtonElement | null;
 let downloadButton: HTMLButtonElement | null;
 let trashButton: HTMLButtonElement | null;
 let inputSelect: HTMLSelectElement | null;
@@ -39,6 +41,10 @@ let uiState: UiState = "ready";
 let pollHandle: number | null = null;
 let pollGeneration = 0;
 let busy = false;
+// Always the destination of the most recent successful "Download" —
+// only meaningful (and the copy button only visible) in the `recorded`
+// state, and only once a save has actually happened.
+let lastSavedPath: string | null = null;
 
 function formatElapsed(totalSeconds: number): string {
   const seconds = Math.max(0, Math.floor(totalSeconds));
@@ -57,6 +63,7 @@ function setUiState(next: UiState) {
   pauseResumeButton?.classList.toggle("hidden", next === "ready" || next === "recorded");
   downloadButton?.classList.toggle("hidden", next !== "recorded");
   trashButton?.classList.toggle("hidden", next !== "recorded");
+  copyPathButton?.classList.toggle("hidden", next !== "recorded" || !lastSavedPath);
 
   const showsDeviceSelects = next === "ready" || next === "paused";
   const height = showsDeviceSelects ? WINDOW_HEIGHT_WITH_SELECTS : WINDOW_HEIGHT_WITHOUT_SELECTS;
@@ -165,6 +172,7 @@ async function startRecording() {
     if (!inputSelect || !outputSelect) return;
     try {
       if (timerEl) timerEl.textContent = "00:00:00";
+      lastSavedPath = null;
       await invoke("start_recording", {
         inputDeviceId: inputSelect.value,
         outputDeviceId: outputSelect.value,
@@ -217,6 +225,8 @@ async function downloadRecording() {
     try {
       const savedTo = await invoke<string | null>("save_recording_as");
       if (savedTo) {
+        lastSavedPath = savedTo;
+        copyPathButton?.classList.remove("hidden");
         setStatus("");
         flashSuccess(downloadButton);
       } else {
@@ -228,10 +238,21 @@ async function downloadRecording() {
   });
 }
 
+async function copyPathToClipboard() {
+  if (!lastSavedPath) return;
+  try {
+    await writeText(lastSavedPath);
+    flashSuccess(copyPathButton);
+  } catch (error) {
+    setStatus(`Pfad konnte nicht kopiert werden: ${error}`);
+  }
+}
+
 async function discardRecording() {
   await withBusyGuard(async () => {
     try {
       await invoke("discard_recording");
+      lastSavedPath = null;
       if (timerEl) timerEl.textContent = "00:00:00";
       setUiState("ready");
       setStatus("");
@@ -247,6 +268,7 @@ window.addEventListener("DOMContentLoaded", () => {
   recordButton = document.querySelector("#record-button");
   stopButton = document.querySelector("#stop-button");
   pauseResumeButton = document.querySelector("#pause-resume-button");
+  copyPathButton = document.querySelector("#copy-path-button");
   downloadButton = document.querySelector("#download-button");
   trashButton = document.querySelector("#trash-button");
   inputSelect = document.querySelector("#input-device-select");
@@ -257,6 +279,7 @@ window.addEventListener("DOMContentLoaded", () => {
   stopButton?.addEventListener("click", stopRecording);
   pauseResumeButton?.addEventListener("click", togglePauseResume);
   downloadButton?.addEventListener("click", downloadRecording);
+  copyPathButton?.addEventListener("click", copyPathToClipboard);
   trashButton?.addEventListener("click", discardRecording);
   document.querySelector("#close-button")?.addEventListener("click", () => invoke("quit_app"));
 
