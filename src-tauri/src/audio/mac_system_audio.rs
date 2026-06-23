@@ -71,10 +71,13 @@ use super::{AudioDevice, AudioError, RecordingResult, Result};
 type WavWriter = hound::WavWriter<BufWriter<File>>;
 
 enum RecorderCommand {
+    Start(PathBuf, Sender<Result<()>>),
     Pause(Sender<Result<()>>),
     Resume(Sender<Result<()>>),
     Stop(Sender<Result<RecordingResult>>),
 }
+
+static SCREEN_CAPTURE_DAEMON: Mutex<Option<Sender<RecorderCommand>>> = Mutex::new(None);
 
 pub struct SystemAudioRecorder {
     control_tx: Sender<RecorderCommand>,
@@ -82,24 +85,11 @@ pub struct SystemAudioRecorder {
 }
 
 impl SystemAudioRecorder {
-    pub fn start(temp_file_path: PathBuf, output_device_uid: Option<String>) -> Result<Self> {
-        let (ready_tx, ready_rx) = channel();
-        let (control_tx, control_rx) = channel();
-
-        let join_handle = std::thread::Builder::new()
-            .name("hyperrec-system-audio-recorder".into())
-            .spawn(move || run_recorder(temp_file_path, output_device_uid, ready_tx, control_rx))
-            .map_err(|e| AudioError::Backend(e.to_string()))?;
-
-        ready_rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| {
-                AudioError::Backend("system audio recorder thread did not become ready".into())
-            })??;
-
+    pub fn start(temp_file_path: PathBuf, _output_device_uid: Option<String>) -> Result<Self> {
+        let control_tx = start_screen_capture_session(temp_file_path)?;
         Ok(Self {
             control_tx,
-            join_handle: Some(join_handle),
+            join_handle: None,
         })
     }
 
@@ -700,7 +690,11 @@ unsafe fn shareable_content() -> Result<Retained<SCShareableContent>> {
         };
         let _ = tx.send(result);
     });
-    SCShareableContent::getShareableContentWithCompletionHandler(&block);
+    // HyperRec records system audio only; it does not need to enumerate the
+    // user's windows. The current-process variant returns redacted content
+    // without triggering the full Screen Recording TCC consent UI on every
+    // recording start, while still giving us a display to attach the stream to.
+    SCShareableContent::getCurrentProcessShareableContentWithCompletionHandler(&block);
     rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
         AudioError::Backend("ScreenCaptureKit shareable content request timed out".into())
     })?
@@ -731,6 +725,188 @@ unsafe fn stop_screen_capture(stream: &SCStream) {
     });
     stream.stopCaptureWithCompletionHandler(Some(&block));
     let _ = rx.recv_timeout(Duration::from_secs(2));
+}
+
+fn start_screen_capture_session(temp_file_path: PathBuf) -> Result<Sender<RecorderCommand>> {
+    let control_tx = screen_capture_daemon_tx()?;
+    let (reply_tx, reply_rx) = channel();
+    control_tx
+        .send(RecorderCommand::Start(temp_file_path, reply_tx))
+        .map_err(|_| AudioError::Backend("system audio recorder thread is gone".into()))?;
+    reply_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| AudioError::Backend("system audio recorder thread did not reply".into()))??;
+    Ok(control_tx)
+}
+
+fn screen_capture_daemon_tx() -> Result<Sender<RecorderCommand>> {
+    let mut daemon = SCREEN_CAPTURE_DAEMON
+        .lock()
+        .map_err(|_| AudioError::Backend("system audio daemon mutex poisoned".into()))?;
+
+    if let Some(control_tx) = daemon.as_ref() {
+        return Ok(control_tx.clone());
+    }
+
+    let (ready_tx, ready_rx) = channel();
+    let (control_tx, control_rx) = channel();
+    std::thread::Builder::new()
+        .name("hyperrec-system-audio-recorder".into())
+        .spawn(move || unsafe { run_screen_capture_daemon(ready_tx, control_rx) })
+        .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| AudioError::Backend("system audio recorder thread did not become ready".into()))??;
+
+    *daemon = Some(control_tx.clone());
+    Ok(control_tx)
+}
+
+fn create_screen_capture_writer(temp_file_path: &PathBuf) -> Result<WavWriter> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 48_000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    hound::WavWriter::create(temp_file_path, spec).map_err(|e| AudioError::Backend(e.to_string()))
+}
+
+unsafe fn run_screen_capture_daemon(
+    ready_tx: Sender<Result<()>>,
+    control_rx: Receiver<RecorderCommand>,
+) {
+    let content = match shareable_content() {
+        Ok(content) => content,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+    let displays = content.displays();
+    let Some(display) = displays.firstObject() else {
+        let _ = ready_tx.send(Err(AudioError::Backend(
+            "ScreenCaptureKit found no display to attach audio capture to".into(),
+        )));
+        return;
+    };
+
+    let excluded_windows: Retained<NSArray<objc2_screen_capture_kit::SCWindow>> =
+        NSArray::from_slice(&[]);
+    let filter = SCContentFilter::initWithDisplay_excludingWindows(
+        SCContentFilter::alloc(),
+        &display,
+        &excluded_windows,
+    );
+    let config = SCStreamConfiguration::new();
+    config.setCapturesAudio(true);
+    config.setExcludesCurrentProcessAudio(false);
+    config.setCaptureMicrophone(false);
+    config.setSampleRate(48_000);
+    config.setChannelCount(2);
+    config.setWidth(2);
+    config.setHeight(2);
+    config.setQueueDepth(3);
+
+    let writer = Arc::new(Mutex::new(None));
+    let current_path = Arc::new(Mutex::new(None::<PathBuf>));
+    let samples_written = Arc::new(AtomicU64::new(0));
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let output = ScreenCaptureOutput::new(writer.clone(), samples_written.clone(), paused.clone());
+    let stream =
+        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
+    let queue = DispatchQueue::new("com.zeitgewinn.hyperrec.screen-capture-audio", None);
+    if let Err(e) = stream.addStreamOutput_type_sampleHandlerQueue_error(
+        ProtocolObject::from_ref::<ScreenCaptureOutput>(&output),
+        SCStreamOutputType::Audio,
+        Some(&queue),
+    ) {
+        let _ = ready_tx.send(Err(AudioError::Backend(format!(
+            "ScreenCaptureKit add audio output failed: {e}"
+        ))));
+        return;
+    }
+
+    eprintln!("HyperRec: starting persistent ScreenCaptureKit system audio capture");
+    if let Err(e) = wait_for_screen_capture_start(&stream) {
+        let _ = ready_tx.send(Err(e));
+        return;
+    }
+    if ready_tx.send(Ok(())).is_err() {
+        stop_screen_capture(&stream);
+        return;
+    }
+
+    while let Ok(command) = control_rx.recv() {
+        match command {
+            RecorderCommand::Start(temp_file_path, reply) => {
+                let result = writer
+                    .lock()
+                    .map_err(|_| AudioError::Backend("wav writer mutex poisoned".into()))
+                    .and_then(|mut guard| {
+                        if guard.is_some() {
+                            return Err(AudioError::InvalidState(
+                                "system audio recording already active".into(),
+                            ));
+                        }
+                        let wav_writer = create_screen_capture_writer(&temp_file_path)?;
+                        samples_written.store(0, Ordering::Relaxed);
+                        paused.store(false, Ordering::Relaxed);
+                        *guard = Some(wav_writer);
+                        *current_path
+                            .lock()
+                            .map_err(|_| AudioError::Backend("wav path mutex poisoned".into()))? =
+                            Some(temp_file_path);
+                        Ok(())
+                    });
+                let _ = reply.send(result);
+            }
+            RecorderCommand::Pause(reply) => {
+                paused.store(true, Ordering::Relaxed);
+                let _ = reply.send(Ok(()));
+            }
+            RecorderCommand::Resume(reply) => {
+                paused.store(false, Ordering::Relaxed);
+                let _ = reply.send(Ok(()));
+            }
+            RecorderCommand::Stop(reply) => {
+                paused.store(true, Ordering::Relaxed);
+                let samples = samples_written.load(Ordering::Relaxed);
+                let duration_seconds = samples as f64 / 2.0 / 48_000.0;
+                eprintln!(
+                    "HyperRec: persistent ScreenCaptureKit audio segment stopped after {:.2}s, wrote {} samples",
+                    duration_seconds, samples
+                );
+                let result = writer
+                    .lock()
+                    .map_err(|_| AudioError::Backend("wav writer mutex poisoned".into()))
+                    .and_then(|mut guard| {
+                        let path = current_path
+                            .lock()
+                            .map_err(|_| AudioError::Backend("wav path mutex poisoned".into()))?
+                            .take()
+                            .ok_or_else(|| AudioError::Backend("wav path already taken".into()))?;
+                        let writer = guard
+                            .take()
+                            .ok_or_else(|| AudioError::Backend("wav writer already taken".into()))?;
+                        Ok((path, writer))
+                    })
+                    .and_then(|(path, w)| {
+                        w.finalize()
+                            .map_err(|e| AudioError::Backend(e.to_string()))
+                            .map(|_| path)
+                    })
+                    .map(|path| RecordingResult {
+                        temp_file_path: path,
+                        duration_seconds,
+                    });
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    stop_screen_capture(&stream);
 }
 
 unsafe fn run_screen_capture_recorder(
@@ -816,6 +992,11 @@ unsafe fn run_screen_capture_recorder(
     let sample_rate = 48_000f64;
     while let Ok(command) = control_rx.recv() {
         match command {
+            RecorderCommand::Start(_, reply) => {
+                let _ = reply.send(Err(AudioError::InvalidState(
+                    "system audio recording already active".into(),
+                )));
+            }
             RecorderCommand::Pause(reply) => {
                 paused.store(true, Ordering::Relaxed);
                 let _ = reply.send(Ok(()));
@@ -990,6 +1171,11 @@ unsafe fn run_recorder_unsafe(
 
     while let Ok(command) = control_rx.recv() {
         match command {
+            RecorderCommand::Start(_, reply) => {
+                let _ = reply.send(Err(AudioError::InvalidState(
+                    "system audio recording already active".into(),
+                )));
+            }
             RecorderCommand::Pause(reply) => {
                 paused.store(true, Ordering::Relaxed);
                 let _ = reply.send(Ok(()));
