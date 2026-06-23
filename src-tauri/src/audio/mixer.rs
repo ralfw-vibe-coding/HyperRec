@@ -14,6 +14,41 @@ use super::{AudioError, RecordingResult, Result};
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 const TARGET_RMS: f32 = 0.07;
 
+fn signal_stats_f32(samples: &[f32]) -> (f32, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut peak = 0.0f32;
+    let mut sum = 0.0f64;
+    for &sample in samples {
+        let abs = sample.abs();
+        if abs > peak {
+            peak = abs;
+        }
+        sum += sample as f64 * sample as f64;
+    }
+    (peak, (sum / samples.len() as f64).sqrt())
+}
+
+fn signal_stats_i16(samples: &[i16]) -> (i16, f64) {
+    if samples.is_empty() {
+        return (0, 0.0);
+    }
+
+    let mut peak = 0i16;
+    let mut sum = 0.0f64;
+    for &sample in samples {
+        let abs = sample.saturating_abs();
+        if abs > peak {
+            peak = abs;
+        }
+        let normalized = sample as f64 / i16::MAX as f64;
+        sum += normalized * normalized;
+    }
+    (peak, (sum / samples.len() as f64).sqrt())
+}
+
 fn read_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     let mut reader =
         hound::WavReader::open(path).map_err(|e| AudioError::Backend(e.to_string()))?;
@@ -430,11 +465,29 @@ pub fn mix_down(
     output_path: &Path,
 ) -> Result<RecordingResult> {
     let (mic_samples, mic_rate) = read_mono_f32(mic_path)?;
+    let (mic_peak, mic_rms) = signal_stats_f32(&mic_samples);
+    eprintln!(
+        "HyperRec: mic wav {:?}: samples={}, rate={}, peak={:.6}, rms={:.6}",
+        mic_path,
+        mic_samples.len(),
+        mic_rate,
+        mic_peak,
+        mic_rms
+    );
     let mut mic_samples = resample_linear(&mic_samples, mic_rate, TARGET_SAMPLE_RATE);
 
     let mixed = match system_path {
         Some(system_path) => {
             let (system_samples, system_rate) = read_mono_f32(system_path)?;
+            let (system_peak, system_rms) = signal_stats_f32(&system_samples);
+            eprintln!(
+                "HyperRec: system wav {:?}: samples={}, rate={}, peak={:.6}, rms={:.6}",
+                system_path,
+                system_samples.len(),
+                system_rate,
+                system_peak,
+                system_rms
+            );
             let mut system_samples =
                 resample_linear(&system_samples, system_rate, TARGET_SAMPLE_RATE);
             if !has_audible_signal(&system_samples) {
@@ -458,8 +511,19 @@ pub fn mix_down(
             }
             mixed
         }
-        None => mic_samples,
+        None => {
+            normalize_to_rms(&mut mic_samples, TARGET_RMS);
+            mic_samples
+        }
     };
+    let (mixed_peak, mixed_rms) = signal_stats_f32(&mixed);
+    eprintln!(
+        "HyperRec: mixed wav {:?}: samples={}, peak={:.6}, rms={:.6}",
+        output_path,
+        mixed.len(),
+        mixed_peak,
+        mixed_rms
+    );
 
     write_mono_i16_wav(output_path, &mixed, TARGET_SAMPLE_RATE)?;
 
@@ -478,9 +542,18 @@ fn write_mic_only(
     mic_path: &Path,
     system_path: Option<&Path>,
     output_path: &Path,
-    mic_samples: Vec<f32>,
+    mut mic_samples: Vec<f32>,
 ) -> Result<RecordingResult> {
+    normalize_to_rms(&mut mic_samples, TARGET_RMS);
     write_mono_i16_wav(output_path, &mic_samples, TARGET_SAMPLE_RATE)?;
+    let (mic_peak, mic_rms) = signal_stats_f32(&mic_samples);
+    eprintln!(
+        "HyperRec: mic-only wav {:?}: samples={}, peak={:.6}, rms={:.6}",
+        output_path,
+        mic_samples.len(),
+        mic_peak,
+        mic_rms
+    );
     std::fs::remove_file(mic_path).ok();
     if let Some(system_path) = system_path {
         std::fs::remove_file(system_path).ok();
@@ -505,6 +578,16 @@ pub fn encode_wav_to_mp3(wav_path: &Path, mp3_path: &Path) -> Result<()> {
         .samples::<i16>()
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| AudioError::Backend(e.to_string()))?;
+    let (peak, rms) = signal_stats_i16(&samples);
+    eprintln!(
+        "HyperRec: encoding wav {:?} to mp3 {:?}: samples={}, rate={}, peak={}, rms={:.6}",
+        wav_path,
+        mp3_path,
+        samples.len(),
+        sample_rate,
+        peak,
+        rms
+    );
 
     let builder = Builder::new()
         .ok_or_else(|| AudioError::Backend("could not create LAME encoder".to_string()))?;

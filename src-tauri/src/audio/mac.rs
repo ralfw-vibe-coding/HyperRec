@@ -179,6 +179,8 @@ fn run_recorder(
 
     let samples_written = Arc::new(AtomicU64::new(0));
     let samples_for_stream = samples_written.clone();
+    let peak_seen = Arc::new(AtomicU64::new(0));
+    let peak_for_stream = peak_seen.clone();
 
     // Pausing toggles this flag instead of calling cpal's stream.pause()/
     // play() again later: restarting a Bluetooth headset's input unit
@@ -201,6 +203,19 @@ fn run_recorder(
                 if let Ok(mut guard) = writer_for_stream.lock() {
                     if let Some(w) = guard.as_mut() {
                         for &sample in data {
+                            let scaled = (sample.abs().min(1.0) * 1_000_000.0) as u64;
+                            let mut current = peak_for_stream.load(Ordering::Relaxed);
+                            while scaled > current {
+                                match peak_for_stream.compare_exchange_weak(
+                                    current,
+                                    scaled,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(next) => current = next,
+                                }
+                            }
                             let _ = w.write_sample(sample);
                         }
                     }
@@ -250,7 +265,15 @@ fn run_recorder(
             RecorderCommand::Stop(reply) => {
                 drop(stream);
                 let samples = samples_written.load(Ordering::Relaxed);
+                let peak = peak_seen.load(Ordering::Relaxed) as f64 / 1_000_000.0;
                 let duration_seconds = samples as f64 / channels as f64 / sample_rate as f64;
+                eprintln!(
+                    "HyperRec: mic recorder stopped after {:.2}s, wrote {} samples to {:?}, peak={:.6}",
+                    duration_seconds,
+                    samples,
+                    temp_file_path,
+                    peak
+                );
 
                 let result = writer
                     .lock()
@@ -491,6 +514,12 @@ impl AudioProvider for MacAudioProvider {
             .final_path
             .take()
             .ok_or_else(|| AudioError::Backend("missing output path".into()))?;
+        eprintln!(
+            "HyperRec: mixing mic {:?}, system {:?}, final {:?}",
+            mic_result.temp_file_path,
+            system_path,
+            final_path
+        );
         super::mixer::mix_down(
             &mic_result.temp_file_path,
             system_path.as_deref(),

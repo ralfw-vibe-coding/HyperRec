@@ -71,12 +71,14 @@ use super::{AudioDevice, AudioError, RecordingResult, Result};
 type WavWriter = hound::WavWriter<BufWriter<File>>;
 
 enum RecorderCommand {
+    #[allow(dead_code)]
     Start(PathBuf, Sender<Result<()>>),
     Pause(Sender<Result<()>>),
     Resume(Sender<Result<()>>),
     Stop(Sender<Result<RecordingResult>>),
 }
 
+#[allow(dead_code)]
 static SCREEN_CAPTURE_DAEMON: Mutex<Option<Sender<RecorderCommand>>> = Mutex::new(None);
 
 pub struct SystemAudioRecorder {
@@ -85,11 +87,24 @@ pub struct SystemAudioRecorder {
 }
 
 impl SystemAudioRecorder {
-    pub fn start(temp_file_path: PathBuf, _output_device_uid: Option<String>) -> Result<Self> {
-        let control_tx = start_screen_capture_session(temp_file_path)?;
+    pub fn start(temp_file_path: PathBuf, output_device_uid: Option<String>) -> Result<Self> {
+        let (ready_tx, ready_rx) = channel();
+        let (control_tx, control_rx) = channel();
+
+        let join_handle = std::thread::Builder::new()
+            .name("hyperrec-system-audio-recorder".into())
+            .spawn(move || run_recorder(temp_file_path, output_device_uid, ready_tx, control_rx))
+            .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| {
+                AudioError::Backend("system audio recorder thread did not become ready".into())
+            })??;
+
         Ok(Self {
             control_tx,
-            join_handle: None,
+            join_handle: Some(join_handle),
         })
     }
 
