@@ -36,8 +36,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "HyperRec Code Signing",
-      "entitlements": "Entitlements.plist"
+      "signingIdentity": "HyperRec Code Signing"
     }
   }
 }
